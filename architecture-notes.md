@@ -45,7 +45,7 @@ flowchart TD
 
 ## 2. Stage 1: Ingestion & Transport
 
-> **Environment Note:** GNU Radio is used here as a **development stand-in only**. Production does not use GNU Radio — the real data source is a live network firehose that feeds IQ frames directly into the ZMQ PUB socket. GNU Radio lets interns generate, replay, or import IQ data locally without needing access to production hardware.
+> **Environment Note:** GNU Radio is used here as a **development stand-in only**. Production does not use GNU Radio — the real data source is a live network firehose that feeds IQ frames directly into the ZMQ PUB socket. GNU Radio allows generating, replaying, or importing IQ data locally without needing access to production hardware.
 
 ZMQ sits at the boundary between whatever produces IQ data and everything downstream. This is intentional: because the ZMQ socket interface is identical regardless of source, the entire processing pipeline is source-agnostic. Swapping GNU Radio for the production firehose requires zero changes to any downstream stage.
 
