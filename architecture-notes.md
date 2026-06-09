@@ -266,7 +266,7 @@ Channelized streams are published to a Kafka-compatible message broker. This dec
 
 ## 8. Production Implementation Notes (Python Stack)
 
-GNU Radio is the development stand-in. In production, the same DSP operations are performed by Python libraries that the team already knows. This section maps each GNU Radio block to its production equivalent.
+GNU Radio is the development stand-in. In production, the same DSP operations are performed by Python libraries. This section maps each GNU Radio block to its production equivalent.
 
 ### Why the GPU matters at 100 MSps
 
