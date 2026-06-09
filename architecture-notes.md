@@ -76,7 +76,28 @@ ZMQ was selected over custom bridge code after benchmarking. GNU Radio ships nat
 Based on the specific operational use case of a target signal, the overall spectrum range is bounded to an expected neighborhood. This stage isolates that specific window and immediately reduces the primary data rate before it hits core memory-bound applications.
 
 ### Implementation Tools
-* **Freq Xlating FIR Filter (Frequency Translating FIR Filter):** Performed in a single, computationally optimized mathematical step. It shifts the center frequency of the target "zone" down to baseband ($0\text{ Hz}$), applies a low-pass filter to discard adjacent spectral noise, and downsamples the data stream.
+* **Freq Xlating FIR Filter (Frequency Translating FIR Filter):** Performs three operations simultaneously in a single, computationally optimized pass: frequency translation, low-pass filtering, and decimation.
+
+### How It Works
+
+The block executes three operations in one pass:
+
+1. **Frequency Shift:** Multiplies every input sample by a complex exponential $e^{j2\pi f_c t}$ where $f_c$ is the `center_freq` parameter. This heterodyne operation shifts the target zone's center frequency down to $0\text{ Hz}$ (baseband) so the downstream filter doesn't need to know anything about the original carrier position.
+
+2. **Low-Pass Filter:** Applies the FIR prototype filter (the `taps` parameter) as a low-pass filter. Everything outside the zone bandwidth — adjacent signals, out-of-band interference — is attenuated. The taps are designed using `firdes.low_pass(gain, samp_rate, cutoff, transition_width)`, where cutoff is set to half the desired output bandwidth.
+
+3. **Decimation:** Discards $D_1 - 1$ out of every $D_1$ samples, reducing the output rate by the decimation factor. Because the FIR filter and decimation are combined (via the Noble Identity — filtering at the lower rate rather than the higher one), this is significantly cheaper than running them as separate blocks.
+
+The result is a single complex baseband stream containing only the selected zone, at a fraction of the original sample rate. Everything downstream operates on this reduced stream and has no awareness of the original wideband context.
+
+### GNU Radio Parameters
+| Parameter | Value | Description |
+|---|---|---|
+| `Type` | Complex→Complex (Complex Taps) | IQ in, IQ out |
+| `Decimation` | `4` | $D_1$ — input rate / output rate |
+| `Taps` | `firdes.low_pass(1.0, samp_rate, zone_rate/2*0.8, zone_rate/2*0.1)` | Prototype low-pass filter |
+| `Center Frequency` | `zone_center` | Frequency to shift to baseband (Hz) |
+| `Sample Rate` | `samp_rate` | Input sample rate, used for tap design |
 
 ### Structural Parameters
 * **Input Sample Rate:** $100\text{ MSps}$
@@ -97,7 +118,31 @@ Based on the specific operational use case of a target signal, the overall spect
 This stage splits the wideband "zone" into a parallel grid of low-rate streams. By dropping the sample rate down to the absolute Nyquist limit of the target signal, downstream classical DSP or machine learning inference can be performed without exhausting host hardware resources.
 
 ### Implementation Tools
-* **PFB Channelizer (Polyphase Filterbank):** Utilizes a highly efficient combination of an FIR prototype filter and a Fast Fourier Transform (FFT) matrix to separate and decimate $N$ channels simultaneously with minimal CPU overhead.
+* **PFB Channelizer (Polyphase Filterbank):** Splits one input stream into $N$ independent output streams simultaneously using a combination of a polyphase FIR filter bank and an FFT matrix — far more efficient than running $N$ separate decimating filters.
+
+### How It Works
+
+A naive implementation of $N$ parallel channels would require $N$ independent Freq Xlating FIR filters, each tuned to a different center frequency. The PFB achieves the same result at a fraction of the cost through two steps:
+
+1. **Polyphase Decomposition:** The prototype low-pass filter (designed with `firdes.low_pass`) is split into $N$ shorter sub-filters called polyphase branches. Each branch processes every $N$-th sample of the input in a round-robin pattern. This distributes the filtering work across $N$ parallel paths without redundant computation.
+
+2. **FFT Fan-out:** After the polyphase branches have filtered their respective sample subsets, a single $N$-point FFT is applied across all branch outputs simultaneously. The FFT performs the frequency separation — each FFT output bin corresponds to one channel center frequency. The result is $N$ independent complex baseband streams, one per channel.
+
+The block presents as one input port and $N$ output ports. Output port $k$ carries the channel centered at:
+$$f_k = k \times \frac{f_{\text{zone}}}{N}$$
+
+To find which channel a signal at frequency $f$ will appear on:
+$$k = \text{round}\left(\frac{f}{f_{\text{channel\_bw}}}\right)$$
+
+Note that the freq sink on each output channel displays frequencies **relative to that channel's center** — a signal at absolute frequency $f$ will appear at offset $f - f_k$ on channel $k$'s display. Set the freq sink's `Center Frequency` to $f_k$ to restore the absolute frequency axis.
+
+### GNU Radio Parameters
+| Parameter | Value | Description |
+|---|---|---|
+| `Channels` | `n_channels` | $N$ — number of output channels and decimation factor |
+| `Taps` | `firdes.low_pass(n_channels, zone_rate, channel_rate/2, channel_rate/10)` | Prototype filter; gain=N normalizes output power |
+| `Oversampling Ratio` | `1.0` | Leave at default unless intentional channel overlap is needed |
+| `Attenuation` | `100` | Used only if Taps is empty; ignored when taps are provided |
 
 ### Advantages
 * **Computational Relief (Multi-Stage Gain):** Isolating a $1\text{ MSps}$ channel straight out of a $100\text{ MSps}$ stream in one step requires a filter with thousands of taps to achieve a steep transition band. Splitting the decimation into two discrete steps ($\text{Stage 1 } [D=4] \rightarrow \text{Stage 2 } [D=25]$) radically reduces total filter tap coefficients and saves billions of CPU floating-point operations per second.
@@ -132,7 +177,43 @@ This stage splits the wideband "zone" into a parallel grid of low-rate streams. 
 
 ## 5. Stage 4: Gatekeeper (Wideband ML Scout)
 
-A lightweight ML model continuously scans the 25 MSps wideband stream as a spectrogram. Its sole job is detection — not decoding. When it spots activity at a frequency, it fires an asynchronous control event to the channelizer pool to open a narrow channel centered on that frequency.
+A lightweight detection model continuously scans the 25 MSps wideband stream as a spectrogram. Its sole job is **detection, not decoding** — it asks "is there something here worth looking at?" rather than "what does this signal say?". When it spots activity at a frequency, it fires an asynchronous control event to the channelizer pool to open a narrow channel centered on that frequency.
+
+### How It Works
+
+The gating loop runs in parallel with the raw IQ stream:
+
+1. **Spectrogram Generation:** The wideband zone stream is windowed into overlapping frames and converted to time-frequency spectrograms via Short-Time Fourier Transform (STFT). Each frame becomes a 2D image: time on one axis, frequency on the other, power on the color/intensity axis.
+
+2. **Detection Scan:** The spectrogram is passed to a detection model. Two approaches are viable and can be combined:
+   * **ML (CNN / U-Net):** A convolutional model trained to recognize signal-shaped features in the spectrogram — bursts, tones, hop patterns — regardless of their exact frequency position. Returns bounding boxes or frequency masks indicating where activity was found.
+   * **Conventional DSP (Energy Detection / CFAR):** A simpler statistical test. Constant False Alarm Rate (CFAR) detection compares each frequency bin's power against a local noise floor estimate. If a bin exceeds the threshold by a configured margin, it is flagged as a detection. No training data required, but less robust against interference and non-stationary noise.
+
+3. **Control Event:** A detection at frequency $f$ maps to a PFB channel index ($k = \text{round}(f / f_{\text{channel\_bw}})$) and fires an async event to the channelizer pool: *"activate channel $k$"*.
+
+4. **Retrospective Capture via Circular Buffer:** The detection event happens *after* the signal has already been in the stream for some time. This is where the circular delay buffer is critical. Rather than only capturing IQ data *from* the moment of detection forward, the buffer holds a sliding window of historical IQ. When a channel is activated, it is seeded with data from the buffer going back to before the detection — so no pre-detection signal content is lost. The depth of retrospective capture is bounded by the buffer size.
+
+```
+Wideband Zone Stream (25 MSps)
+        │
+        ├──► Circular Delay Buffer (holds N seconds of history)
+        │                │
+        │                ▼
+        └──► Spectrogram Generator
+                    │
+                    ▼
+             Detection Model
+          (ML or CFAR or both)
+                    │
+              Detection @ freq f
+                    │
+                    ▼
+         k = round(f / channel_bw)
+                    │
+              Control Event ──► Channelizer Pool: activate channel k
+                                        │
+                              ◄─── seed with buffer history
+```
 
 ### Design Decisions
 
