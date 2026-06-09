@@ -286,62 +286,13 @@ At 100 MSps with complex float32 samples, the raw data rate is $100 \times 10^6 
 
 **When to use:** GPU is available and data rate is at or near 100 MSps real-time.
 
-```python
-import cupy as cp
-import cusignal
-
-# --- Stage 2: Freq Xlating FIR (zone selector) ---
-samp_rate   = 100e6
-zone_rate   = 25e6
-decimation  = int(samp_rate / zone_rate)
-taps        = cusignal.firwin(255, zone_rate / samp_rate)  # normalized cutoff
-
-def freq_xlating_fir(iq_chunk, center_freq, samp_rate, taps, decimation):
-    t     = cp.arange(len(iq_chunk)) / samp_rate
-    mixed = iq_chunk * cp.exp(-2j * cp.pi * center_freq * t)  # shift to baseband
-    filtered = cusignal.lfilter(taps, [1.0], mixed)           # low-pass filter
-    return filtered[::decimation]                              # decimate
-
-# --- Stage 3: PFB Channelizer ---
-def pfb_channelizer(zone_iq, n_channels, proto_taps):
-    # Reshape into polyphase branches
-    trimmed   = zone_iq[:len(zone_iq) - len(zone_iq) % n_channels]
-    branches  = trimmed.reshape(-1, n_channels).T              # shape: (N, samples/N)
-    # Apply per-branch prototype filter
-    filtered  = cp.array([
-        cusignal.lfilter(proto_taps[i::n_channels], [1.0], branches[i])
-        for i in range(n_channels)
-    ])
-    # FFT across branches to separate channels
-    return cp.fft.fft(filtered, axis=0)                        # shape: (N, samples/N)
-```
+The Freq Xlating FIR maps to `cusignal.firwin` for tap design and `cusignal.lfilter` for filtering, with the frequency shift implemented as a sample-wise multiply by a complex exponential. The PFB Channelizer maps to a polyphase reshape followed by per-branch filtering and `cupy.fft.fft` across the branches — the same math as the GNU Radio block, running on GPU memory.
 
 ### Fallback Stack: SciPy + Numba (CPU)
 
 **When to use:** No GPU available, or processing offline / in batch mode (e.g., replaying RadioML dataset files).
 
-```python
-import numpy as np
-from scipy.signal import firwin, lfilter
-from numba import njit
-
-taps = firwin(255, 0.25)  # normalized cutoff = zone_rate / samp_rate
-
-@njit
-def decimate_filter(iq, taps, factor):
-    # Numba JIT compiles this loop to near-C speed
-    out = np.zeros(len(iq) // factor, dtype=np.complex64)
-    for i in range(len(out)):
-        acc = 0.0 + 0.0j
-        for k in range(len(taps)):
-            idx = i * factor - k
-            if 0 <= idx < len(iq):
-                acc += taps[k] * iq[idx]
-        out[i] = acc
-    return out
-```
-
-Numba's `@njit` decorator compiles the inner FIR loop to native machine code on first call, removing Python interpreter overhead for the hot path. The tradeoff versus cuSignal is that Numba still runs on CPU cores and will compete with the Kafka producer and gatekeeper event loop for CPU time at high data rates.
+`scipy.signal.firwin` and `scipy.signal.lfilter` are direct functional equivalents for tap design and filtering. The inner FIR convolution loop can be decorated with Numba's `@njit` to compile it to native machine code on first call, removing Python interpreter overhead for the hot path. The tradeoff versus cuSignal is that Numba still runs on CPU cores and will compete with the Kafka producer and gatekeeper event loop for CPU time at high data rates.
 
 ### Packet Capture and the GIL
 
@@ -363,25 +314,8 @@ The ZMQ abstraction boundary solves this cleanly. A separate capture process (wh
 
 ### RadioML Dataset Integration
 
-The RadioML 2018 dataset (HDF5 format) is a practical source of realistic modulated signals for testing the pipeline without production hardware. Converting to raw binary for `File Source` in GNU Radio, or directly into NumPy arrays for the production stack:
+The RadioML 2018 dataset (HDF5 format) is a practical source of realistic modulated signals for testing the pipeline without production hardware. The dataset stores complex IQ samples as float32 pairs alongside modulation class labels and per-example SNR values.
 
-```python
-import h5py
-import numpy as np
+To use with GNU Radio: extract the IQ arrays from HDF5 and write them as raw complex float32 binary files, which the `File Source` block can read directly with `repeat` enabled for a continuous stream.
 
-with h5py.File("GOLD_XYZ_OSC.0001_1024.hdf5", "r") as f:
-    iq_data = f["X"][:]          # shape: (num_samples, 1024, 2) — float32
-    labels  = f["Y"][:]          # one-hot modulation class labels
-    snr     = f["Z"][:]          # SNR per example
-
-# Convert to complex IQ
-iq_complex = iq_data[:, :, 0] + 1j * iq_data[:, :, 1]  # shape: (N, 1024)
-
-# Frequency-shift a signal to sit at a specific offset within your zone
-# so it lands in a known PFB channel
-def place_signal_at_freq(iq, target_freq, samp_rate):
-    t = np.arange(iq.shape[-1]) / samp_rate
-    return iq * np.exp(2j * np.pi * target_freq * t)
-```
-
-Inject `place_signal_at_freq(iq_complex[i], 300e3, zone_rate)` to place a RadioML signal at 300 kHz within the zone — it will land in the same PFB channel your sine wave test used, but with realistic modulation content and configurable SNR.
+To use with the Python production stack: load the HDF5 directly via `h5py`, convert the float32 pairs to complex64 arrays, then frequency-shift individual examples to a target offset within the zone before injection. A signal placed at 300 kHz will land in the same PFB channel as the sine wave test, but with realistic modulation shape, spectral rolloff, and configurable SNR — a much more honest validation of the gatekeeper detection model.
