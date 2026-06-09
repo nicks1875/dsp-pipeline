@@ -132,7 +132,7 @@ The block presents as one input port and $N$ output ports. Output port $k$ carri
 $$f_k = k \times \frac{f_\text{zone}}{N}$$
 
 To find which channel a signal at frequency $f$ will appear on, where $B_c = f_\text{zone} / N$ is the per-channel bandwidth:
-$$k = \operatorname{round}\!\left(\frac{f}{B_c}\right)$$
+$$k = \text{round}\left(\frac{f}{B_c}\right)$$
 
 Note that the freq sink on each output channel displays frequencies **relative to that channel's center** — a signal at absolute frequency $f$ will appear at offset $f - f_k$ on channel $k$'s display. Set the freq sink's `Center Frequency` to $f_k$ to restore the absolute frequency axis.
 
