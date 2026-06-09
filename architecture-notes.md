@@ -261,3 +261,127 @@ Channelized streams are published to a Kafka-compatible message broker. This dec
 > Each active 1 MSps channel stream needs its own topic partition to allow parallel consumers. But Kafka partition count is a permanent decision at topic creation time.
 >
 > Consider: How many simultaneous active channels does your worst-case scenario require? How do you handle a burst of ML scout detections that briefly exceeds your partition count?
+
+---
+
+## 8. Production Implementation Notes (Python Stack)
+
+GNU Radio is the development stand-in. In production, the same DSP operations are performed by Python libraries that the team already knows. This section maps each GNU Radio block to its production equivalent.
+
+### Why the GPU matters at 100 MSps
+
+At 100 MSps with complex float32 samples, the raw data rate is $100 \times 10^6 \times 8\text{ bytes} = 800\text{ MB/s}$. The Freq Xlating FIR alone must apply hundreds of FIR taps to every sample in real time. On CPU this is feasible but leaves little headroom for the channelizer, spectrogram generator, and ML inference running in parallel. GPU offload moves the bulk multiply-accumulate work off the CPU entirely, freeing it for control logic, Kafka I/O, and the gatekeeper event loop.
+
+### Block-to-Library Mapping
+
+| GNU Radio Block | Production Python Equivalent | Notes |
+|---|---|---|
+| `Freq Xlating FIR Filter` | `cusignal.firwin` + manual frequency shift | Multiply by `np.exp(2j*np.pi*fc*t)` then apply FIR via `cusignal.lfilter` |
+| `PFB Channelizer` | Polyphase decomposition via `cupy.fft.fft` | Reshape input into N rows, apply per-branch FIR, FFT across rows |
+| `Spectrogram Generator` | `cusignal.stft` or `scipy.signal.stft` | GPU preferred for the wideband zone; CPU viable per narrowband channel |
+| `ZMQ SUB Source` | `pyzmq` (`zmq.SUB` socket) | Direct API equivalent, same HWM tuning applies |
+| `Kafka / Redpanda Sink` | `confluent-kafka` Python client | One producer per active channel stream |
+
+### Primary Stack: cuSignal (GPU)
+
+**When to use:** GPU is available and data rate is at or near 100 MSps real-time.
+
+```python
+import cupy as cp
+import cusignal
+
+# --- Stage 2: Freq Xlating FIR (zone selector) ---
+samp_rate   = 100e6
+zone_rate   = 25e6
+decimation  = int(samp_rate / zone_rate)
+taps        = cusignal.firwin(255, zone_rate / samp_rate)  # normalized cutoff
+
+def freq_xlating_fir(iq_chunk, center_freq, samp_rate, taps, decimation):
+    t     = cp.arange(len(iq_chunk)) / samp_rate
+    mixed = iq_chunk * cp.exp(-2j * cp.pi * center_freq * t)  # shift to baseband
+    filtered = cusignal.lfilter(taps, [1.0], mixed)           # low-pass filter
+    return filtered[::decimation]                              # decimate
+
+# --- Stage 3: PFB Channelizer ---
+def pfb_channelizer(zone_iq, n_channels, proto_taps):
+    # Reshape into polyphase branches
+    trimmed   = zone_iq[:len(zone_iq) - len(zone_iq) % n_channels]
+    branches  = trimmed.reshape(-1, n_channels).T              # shape: (N, samples/N)
+    # Apply per-branch prototype filter
+    filtered  = cp.array([
+        cusignal.lfilter(proto_taps[i::n_channels], [1.0], branches[i])
+        for i in range(n_channels)
+    ])
+    # FFT across branches to separate channels
+    return cp.fft.fft(filtered, axis=0)                        # shape: (N, samples/N)
+```
+
+### Fallback Stack: SciPy + Numba (CPU)
+
+**When to use:** No GPU available, or processing offline / in batch mode (e.g., replaying RadioML dataset files).
+
+```python
+import numpy as np
+from scipy.signal import firwin, lfilter
+from numba import njit
+
+taps = firwin(255, 0.25)  # normalized cutoff = zone_rate / samp_rate
+
+@njit
+def decimate_filter(iq, taps, factor):
+    # Numba JIT compiles this loop to near-C speed
+    out = np.zeros(len(iq) // factor, dtype=np.complex64)
+    for i in range(len(out)):
+        acc = 0.0 + 0.0j
+        for k in range(len(taps)):
+            idx = i * factor - k
+            if 0 <= idx < len(iq):
+                acc += taps[k] * iq[idx]
+        out[i] = acc
+    return out
+```
+
+Numba's `@njit` decorator compiles the inner FIR loop to native machine code on first call, removing Python interpreter overhead for the hot path. The tradeoff versus cuSignal is that Numba still runs on CPU cores and will compete with the Kafka producer and gatekeeper event loop for CPU time at high data rates.
+
+### Packet Capture and the GIL
+
+Python's Global Interpreter Lock (GIL) prevents true parallel execution across threads. At 100 MSps, the receive loop and DSP processing cannot both run in the same Python process without one starving the other.
+
+The ZMQ abstraction boundary solves this cleanly. A separate capture process (which can be a minimal C program, a shell script piping `tcpdump`, or even a second Python process with its own GIL) handles the raw UDP receive and publishes over ZMQ. The Python DSP process subscribes and only sees clean IQ frames — it never touches the network socket. Each process has its own GIL and runs independently.
+
+```
+┌─────────────────────────┐        ┌──────────────────────────────┐
+│  Capture Process        │        │  DSP Process (Python)        │
+│  (C / minimal Python)   │        │                              │
+│                         │        │  zmq.SUB → cuSignal FIR      │
+│  UDP socket recv        │─ZMQ───►│  → PFB Channelizer           │
+│  → ZMQ PUB              │        │  → Spectrogram + ML Scout    │
+│                         │        │  → confluent-kafka producer  │
+└─────────────────────────┘        └──────────────────────────────┘
+       own GIL                              own GIL
+```
+
+### RadioML Dataset Integration
+
+The RadioML 2018 dataset (HDF5 format) is a practical source of realistic modulated signals for testing the pipeline without production hardware. Converting to raw binary for `File Source` in GNU Radio, or directly into NumPy arrays for the production stack:
+
+```python
+import h5py
+import numpy as np
+
+with h5py.File("GOLD_XYZ_OSC.0001_1024.hdf5", "r") as f:
+    iq_data = f["X"][:]          # shape: (num_samples, 1024, 2) — float32
+    labels  = f["Y"][:]          # one-hot modulation class labels
+    snr     = f["Z"][:]          # SNR per example
+
+# Convert to complex IQ
+iq_complex = iq_data[:, :, 0] + 1j * iq_data[:, :, 1]  # shape: (N, 1024)
+
+# Frequency-shift a signal to sit at a specific offset within your zone
+# so it lands in a known PFB channel
+def place_signal_at_freq(iq, target_freq, samp_rate):
+    t = np.arange(iq.shape[-1]) / samp_rate
+    return iq * np.exp(2j * np.pi * target_freq * t)
+```
+
+Inject `place_signal_at_freq(iq_complex[i], 300e3, zone_rate)` to place a RadioML signal at 300 kHz within the zone — it will land in the same PFB channel your sine wave test used, but with realistic modulation content and configurable SNR.
