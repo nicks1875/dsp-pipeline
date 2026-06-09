@@ -129,10 +129,10 @@ A naive implementation of $N$ parallel channels would require $N$ independent Fr
 2. **FFT Fan-out:** After the polyphase branches have filtered their respective sample subsets, a single $N$-point FFT is applied across all branch outputs simultaneously. The FFT performs the frequency separation — each FFT output bin corresponds to one channel center frequency. The result is $N$ independent complex baseband streams, one per channel.
 
 The block presents as one input port and $N$ output ports. Output port $k$ carries the channel centered at:
-$$f_k = k \times \frac{f_{\text{zone}}}{N}$$
+$$f_k = k \times \frac{f_\text{zone}}{N}$$
 
-To find which channel a signal at frequency $f$ will appear on:
-$$k = \text{round}\left(\frac{f}{f_{\text{channel\_bw}}}\right)$$
+To find which channel a signal at frequency $f$ will appear on, where $B_c = f_\text{zone} / N$ is the per-channel bandwidth:
+$$k = \operatorname{round}\!\left(\frac{f}{B_c}\right)$$
 
 Note that the freq sink on each output channel displays frequencies **relative to that channel's center** — a signal at absolute frequency $f$ will appear at offset $f - f_k$ on channel $k$'s display. Set the freq sink's `Center Frequency` to $f_k$ to restore the absolute frequency axis.
 
